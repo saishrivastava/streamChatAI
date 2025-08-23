@@ -17,20 +17,107 @@ export class OpenAIResponseHandler {
     private readonly chatClient: StreamChat,
     private readonly channel: Channel,
     private readonly message: MessageResponse,
-    private readonly onDisposal: () => void
+    private readonly onDispose: () => void
   ) {
     this.chatClient.on("ai_indicator.stop", this.handleStopGenerating);
   }
 
   run = async () => {};
 
-  dispose = async () => {};
+  dispose = async () => {
+    if (this.is_done) return;
+    this.is_done = true;
+    this.chatClient.off("ai_indicator.stop", this.handleStopGenerating);
+    this.onDispose();
+  };
 
-  private handleStopGenerating = async (event: Event) => {};
+  private handleStopGenerating = async (event: Event) => {
+    if (this.is_done || event.message_id !== this.message.id) return;
 
-  private handleStreamEvent = async (event: Event) => {};
+    try {
+        // TODO: Migrate to the new Responses API as this method is deprecated.
+        await this.openAi.beta.threads.runs.cancel(
+            this.run_id,
+            { thread_id: this.openAiThread.id }
+        );
+    } catch (error) {
+        console.error(`Error cancelling the run, ${error}`)
+    }
 
-  private handleError = async (event: Event) => {};
+    await this.channel.sendEvent({
+        type: "ai_indicator.clear",
+        cid: this.message.cid,
+        message_id: this.message.id,
+    });
+
+    await this.dispose();
+
+  };
+
+  private handleStreamEvent = async (event: OpenAI.Beta.Assistants.AssistantStreamEvent) => {
+    const {cid, id} = this.message
+    if(event.event === "thread.run.created"){
+        this.run_id = event.data.id
+    } else if (event.event === "thread.message.delta"){
+        const textDelta = event.data.delta.content?.[0]
+        if(textDelta?.type === "text" && textDelta.text){
+            this.message.text += textDelta.text.value || ""
+            const now = Date.now()
+
+            if(now - this.last_update_time > 1000) {
+                this.chatClient.partialUpdateMessage(id, {
+                    set: {
+                        text: this.message.text
+                    }
+                })
+                this.last_update_time = now;
+            }
+            this.chunk_counter += 1
+
+        }
+    } else if (event.event === "thread.message.completed"){
+        this.chatClient.partialUpdateMessage(id, {
+            set: {
+                text: event.data.content[0].type === "text" ? event.data.content[0].text.value : this.message.text,
+            },
+        });
+
+        this.channel.sendEvent({
+            type: "ai_indicator.clear",
+            cid,
+            message_id: id,
+        })
+    } else if (event.event === "thread.run.step.created"){
+        if(event.data.step_details.type === "message_creation"){
+            this.channel.sendEvent({
+                type: "ai_indicator.update",
+                ai_state: "AI_STATE_CHECKING_SOURCES",
+                cid,
+                message_id: id,
+            })
+        }
+    }
+  };
+
+  private handleError = async (error: Error) => {
+    if (this.is_done) return;
+    await this.channel.sendEvent({
+      type: "ai_indicator.update",
+      ai_state: "AI_STATE_ERROR",
+      cid: this.message.cid,
+      message_id: this.message.id,
+    });
+
+    await this.chatClient.partialUpdateMessage(this.message.id, {
+      set: {
+        text:
+          error.message ?? `An error occurred while generating the message.`,
+        messaage: error.toString(),
+      },
+    });
+
+    await this.dispose();
+  };
 
   private performWebSearch = async (query: String): Promise<string> => {
     const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
